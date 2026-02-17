@@ -1,0 +1,7 @@
+{
+  "name": "Face Liveness Detection System",
+  "description": "A web application that uses a 2-in-1 approach with motion and vision AI models to detect face liveness in real-time.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
