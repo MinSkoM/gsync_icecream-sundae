@@ -1,230 +1,237 @@
+import os
 
+# --- 1. สั่งใบ้หวย System Variable ก่อนทำอย่างอื่น ---
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" # ยอมให้ Library ซ้ำกันได้ (สำคัญมาก!)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+# --- 2. Import OpenCV เป็นตัวแรก (ต้องมาก่อน TensorFlow!) ---
+import cv2
+# สั่งปิด Multi-threading ของ OpenCV ทันที
+cv2.setNumThreads(0) 
+
+# --- 3. จากนั้นค่อย Import TensorFlow ---
+import tensorflow as tf
+
+# 🔥 Hackathon Hotfix: Patch Keras (ใส่ตรงนี้เหมือนเดิม)
+original_layer_init = tf.keras.layers.Layer.__init__
+
+def patched_layer_init(self, *args, **kwargs):
+    kwargs.pop('quantization_config', None)
+    original_layer_init(self, *args, **kwargs)
+
+tf.keras.layers.Layer.__init__ = patched_layer_init
+
+# --- 4. Import Library อื่นๆ ---
 import json
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-import os
-import cv2
-import uuid
 import tempfile
+import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import logging
-from typing import Dict, Any, List
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- App Initialization ---
-app = FastAPI(
-    title="Face Liveness Detection API",
-    description="Processes video and motion data to determine face liveness.",
-    version="1.0.0"
-)
+app = FastAPI()
 
-# --- CORS Configuration ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- Motion Model (LivenessPredictor Class) ---
-class LivenessPredictor:
-    def __init__(self, model_path: str):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Motion model not found at {model_path}")
-        self.model = tf.keras.models.load_model(model_path)
-        self.MAX_SEQ_LENGTH = 80
-        self.NUM_LANDMARKS = 28 * 3
-        self.NUM_SENSORS = 6
-        self.NUM_BG = 6
-        self.ENABLE_SMOOTHING = True
-        self.SMOOTH_SPAN = 3
+# --- CONFIG ---
+MAX_SEQ_LENGTH = 80
+NUM_LANDMARKS = 9
+# ตามไฟล์ preall.py และ training script
+SMOOTH_SPAN = 3 
+DECISION_THRESHOLD = 0.5 # ปรับได้ตามความเหมาะสม
 
-    def _safe_float(self, val: Any) -> float:
-        try:
-            return float(val) if val is not None else 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _perform_temporal_alignment(self, seq: List[List[float]], feature_dim: int) -> np.ndarray:
-        seq_len = len(seq)
-        np_seq = np.array(seq, dtype=np.float32)
-        
-        if seq_len > self.MAX_SEQ_LENGTH:
-            start = (seq_len - self.MAX_SEQ_LENGTH) // 2
-            return np_seq[start:start + self.MAX_SEQ_LENGTH]
-        elif seq_len < self.MAX_SEQ_LENGTH:
-            padding = np.zeros((self.MAX_SEQ_LENGTH - seq_len, feature_dim), dtype=np.float32)
-            return np.vstack([np_seq, padding])
-        return np_seq
-
-    def _process_signal_data(self, data_seq: np.ndarray) -> np.ndarray:
-        if data_seq.size == 0:
-            return np.zeros((self.MAX_SEQ_LENGTH, data_seq.shape[1] if data_seq.ndim > 1 else 1))
-        
-        df = pd.DataFrame(data_seq)
-        if self.ENABLE_SMOOTHING:
-            df = df.ewm(span=self.SMOOTH_SPAN, adjust=False).mean()
-        
-        vals = df.astype(float).fillna(0.0).values
-        median = np.median(vals, axis=0)
-        q75, q25 = np.percentile(vals, [75, 25], axis=0)
-        iqr = q75 - q25
-        iqr[iqr == 0] = 1.0
-        normalized = (vals - median) / iqr
-        return np.clip(normalized, -4.0, 4.0)
-
-    def _extract_features(self, json_data: Dict[str, Any]) -> (np.ndarray, np.ndarray, np.ndarray):
-        frames = json_data.get('data', [])
-        if not frames:
-            raise ValueError("No frames found in JSON data")
-
-        lm_seq, sn_seq, bg_seq = [], [], []
-        for frame in frames:
-            lm_seq.append(frame.get('faceMesh', [])[:self.NUM_LANDMARKS])
-            
-            sensors = frame.get('sensors', {})
-            accel = sensors.get('accel', {})
-            gyro = sensors.get('gyro', {})
-            sn_seq.append([
-                self._safe_float(accel.get('x')), self._safe_float(accel.get('y')), self._safe_float(accel.get('z')),
-                self._safe_float(gyro.get('x')), self._safe_float(gyro.get('y')), self._safe_float(gyro.get('z'))
-            ])
-            
-            motion = frame.get('motion_analysis', {})
-            bg_seq.append([
-                self._safe_float(motion.get('face_dx')), self._safe_float(motion.get('face_dy')),
-                self._safe_float(motion.get('bg_dx')), self._safe_float(motion.get('bg_dy')),
-                self._safe_float(motion.get('relative_magnitude')),
-                self._safe_float(frame.get('bg_variance'))
-            ])
-        
-        aligned_lm = self._perform_temporal_alignment(lm_seq, self.NUM_LANDMARKS)
-        aligned_sn = self._perform_temporal_alignment(sn_seq, self.NUM_SENSORS)
-        aligned_bg = self._perform_temporal_alignment(bg_seq, self.NUM_BG)
-        
-        processed_sn = self._process_signal_data(aligned_sn)
-        processed_bg = self._process_signal_data(aligned_bg)
-
-        # Normalize landmarks
-        lm_df = pd.DataFrame(aligned_lm).astype(float).fillna(0.0)
-        processed_lm = ((lm_df - lm_df.mean()) / (lm_df.std().replace(0, 1))).fillna(0.0).values
-        
-        return processed_lm, processed_sn, processed_bg
-
-    def predict(self, json_data: Dict[str, Any], threshold: float = 0.5) -> Dict[str, Any]:
-        try:
-            lm, sn, bg = self._extract_features(json_data)
-        except ValueError as e:
-            return {"status": "error", "message": str(e)}
-
-        input_lm = np.expand_dims(lm, axis=0)
-        input_sn = np.expand_dims(sn, axis=0)
-        input_bg = np.expand_dims(bg, axis=0)
-        
-        score = self.model.predict([input_lm, input_sn, input_bg], verbose=0)[0][0]
-        label = "REAL" if score > threshold else "SPOOF"
-        
-        return {"status": "success", "label": label, "score": float(score), "confidence": f"{score:.2%}"}
-
-# --- Vision Model (predict_video function) ---
-IMG_SIZE = (224, 224)
+# --- LOAD MODELS ---
 try:
-    vision_model = tf.keras.models.load_model("vision.keras")
-except IOError:
+    logger.info("⏳ Loading Motion Model...")
+    motion_model = tf.keras.models.load_model("Model/Motion.keras")
+    logger.info("✅ Motion Model Loaded.")
+    
+    logger.info("⏳ Loading Vision Model...")
+    vision_model = tf.keras.models.load_model("Model/Vision.keras")
+    logger.info("✅ Vision Model Loaded.")
+except Exception as e:
+    logger.error(f"❌ Critical Error Loading Models: {e}")
+    motion_model = None
     vision_model = None
-    logger.error("Vision model 'vision.keras' not found. Vision predictions will be disabled.")
 
-def predict_video(video_path: str, threshold: float = 0.5) -> Dict[str, Any]:
-    if vision_model is None:
-        return {"status": "error", "message": "Vision model not loaded"}
+def preprocess_motion(json_data):
+    """
+    Logic เดียวกับ preall.py:
+    1. Extract faceMesh (9 points) & sensors (6 values)
+    2. Exponential Smoothing (span=3)
+    3. Z-Score Normalization (per sequence)
+    4. Padding/Truncate to 80 frames
+    """
+    frames = json_data.get('data', [])
+    if not frames:
+        raise ValueError("No frames in JSON")
+
+    lm_seq = []
+    sn_seq = []
+
+    for frame in frames:
+        # Extract Landmarks (Flat list)
+        mesh = frame.get('faceMesh', [])
+        if len(mesh) < NUM_LANDMARKS:
+            mesh += [0.0] * (NUM_LANDMARKS - len(mesh))
+        lm_seq.append(mesh[:NUM_LANDMARKS])
+
+        # Extract Sensors
+        s = frame.get('sensors', {})
+        acc = s.get('accel', {'x':0, 'y':0, 'z':0})
+        gyr = s.get('gyro', {'x':0, 'y':0, 'z':0})
+        # เช็ค null
+        ax = acc['x'] if acc['x'] is not None else 0
+        ay = acc['y'] if acc['y'] is not None else 0
+        az = acc['z'] if acc['z'] is not None else 0
+        gx = gyr['x'] if gyr['x'] is not None else 0
+        gy = gyr['y'] if gyr['y'] is not None else 0
+        gz = gyr['z'] if gyr['z'] is not None else 0
         
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return {"status": "error", "message": "Could not open video file."}
+        sn_seq.append([ax, ay, az, gx, gy, gz])
 
-    frame_scores = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = tf.image.resize(frame_rgb, IMG_SIZE)
-        img = tf.cast(img, tf.float32) / 255.0
-        img_array = tf.expand_dims(img, axis=0)
-        
-        score = vision_model.predict(img_array, verbose=0)
-        frame_scores.append(score[0][0])
-    
-    cap.release()
-    
-    if not frame_scores:
-        return {"status": "error", "message": "No frames processed from video."}
-    
-    final_score = np.mean(frame_scores)
-    label = "LIVE" if final_score >= threshold else "SPOOF"
-    
-    return {"status": "success", "label": label, "score": float(final_score)}
+    # Convert to DF for Smoothing
+    lm_df = pd.DataFrame(lm_seq)
+    sn_df = pd.DataFrame(sn_seq)
 
-# --- Load Models ---
-try:
-    motion_predictor = LivenessPredictor(model_path='motion.keras')
-except FileNotFoundError as e:
-    motion_predictor = None
-    logger.error(f"Error loading motion model: {e}. Motion predictions will be disabled.")
+    # 1. Smoothing
+    lm_smooth = lm_df.ewm(span=SMOOTH_SPAN, adjust=False).mean().values
+    sn_smooth = sn_df.ewm(span=SMOOTH_SPAN, adjust=False).mean().values
 
+    # 2. Normalization (Z-Score per sample)
+    lm_mean = np.mean(lm_smooth, axis=0)
+    lm_std = np.std(lm_smooth, axis=0) + 1e-6
+    lm_norm = (lm_smooth - lm_mean) / lm_std
 
-# --- API Endpoint ---
-@app.post("/api/predict/liveness")
-async def predict_liveness_endpoint(video_file: UploadFile = File(...), json_file: UploadFile = File(...)):
-    if motion_predictor is None or vision_model is None:
-        raise HTTPException(status_code=503, detail="One or more AI models are not available.")
-        
-    # Process JSON file
-    try:
-        json_content = await json_file.read()
-        motion_data = json.loads(json_content)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON file.")
-    finally:
-        await json_file.close()
+    sn_mean = np.mean(sn_smooth, axis=0)
+    sn_std = np.std(sn_smooth, axis=0) + 1e-6
+    sn_norm = (sn_smooth - sn_mean) / sn_std
 
-    motion_result = motion_predictor.predict(motion_data)
-    
-    # Process video file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-        content = await video_file.read()
-        tmp_video.write(content)
-        tmp_video_path = tmp_video.name
-    
-    await video_file.close()
-    
-    vision_result = predict_video(tmp_video_path)
-    
-    # Clean up temporary video file
-    os.unlink(tmp_video_path)
-    
-    # Determine final verdict
-    is_motion_real = motion_result.get("label") == "REAL"
-    is_vision_live = vision_result.get("label") == "LIVE"
-    
-    if is_motion_real and is_vision_live:
-        final_verdict = "LIVENESS CONFIRMED"
+    # 3. Padding / Truncating
+    curr_len = len(lm_norm)
+    if curr_len < MAX_SEQ_LENGTH:
+        pad_len = MAX_SEQ_LENGTH - curr_len
+        lm_final = np.pad(lm_norm, ((0, pad_len), (0, 0)), mode='constant')
+        sn_final = np.pad(sn_norm, ((0, pad_len), (0, 0)), mode='constant')
     else:
-        final_verdict = "LIVENESS DENIED"
-        
+        lm_final = lm_norm[:MAX_SEQ_LENGTH]
+        sn_final = sn_norm[:MAX_SEQ_LENGTH]
+
     return {
-        "motion_model": motion_result,
-        "vision_model": vision_result,
-        "final_verdict": final_verdict
+        "lm": np.expand_dims(lm_final, axis=0), 
+        "sn": np.expand_dims(sn_final, axis=0)
     }
 
-@app.get("/")
-def read_root():
-    return {"message": "Liveness Detection API is running."}
+def process_video_frames(video_path):
+    """
+    ดึงเฟรมจากวิดีโอมา 5 เฟรม (กระจายทั่วคลิป) เพื่อส่งเข้า Vision Model
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if total_frames < 1:
+        return np.array([])
+
+    # เลือก 5 เฟรม กระจายๆ กัน
+    indices = np.linspace(0, total_frames - 1, 5, dtype=int)
+    batch_images = []
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # Resize 224x224
+            frame = cv2.resize(frame, (224, 224))
+            # Convert BGR to RGB (เพราะ OpenCV อ่านเป็น BGR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            batch_images.append(frame)
+    
+    cap.release()
+    return np.array(batch_images) # (N, 224, 224, 3)
+
+@app.post("/api/predict/liveness")
+async def predict(
+    video_file: UploadFile = File(...), 
+    json_file: UploadFile = File(...)
+):
+    if not motion_model or not vision_model:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+    # --- 1. MOTION PREDICTION ---
+    motion_score = 0.0
+    try:
+        content = await json_file.read()
+        data = json.loads(content)
+        
+        inputs = preprocess_motion(data)
+        preds = motion_model.predict(inputs)
+        motion_score = float(preds[0][0])
+        logger.info(f"🧠 Motion Score: {motion_score}")
+        
+    except Exception as e:
+        logger.error(f"Motion Error: {e}")
+        # ถ้าพัง ให้คะแนนต่ำสุด
+        motion_score = 0.0
+
+    # --- 2. VISION PREDICTION ---
+    vision_score = 0.0
+    try:
+        # Save video temp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(await video_file.read())
+            tmp_path = tmp.name
+        
+        frames = process_video_frames(tmp_path)
+        os.unlink(tmp_path) # ลบไฟล์ทิ้ง
+
+        if len(frames) > 0:
+            # Model Vision มี Rescaling layer อยู่ข้างในแล้ว (scale=1/127.5)
+            # ดังนั้นส่งค่า 0-255 ไปได้เลย ไม่ต้องหารเอง
+            v_preds = vision_model.predict(frames)
+            vision_score = float(np.mean(v_preds))
+            logger.info(f"👁️ Vision Score: {vision_score}")
+        
+    except Exception as e:
+        logger.error(f"Vision Error: {e}")
+        vision_score = 0.0
+
+    # --- 3. FUSION LOGIC ---
+    # ใช้ Weighted Average แบบเดียวกับ preall.py
+    # (vision * 0.4) + (motion * 0.6)
+    
+    final_score = (vision_score * 0.4) + (motion_score * 0.6)
+    is_live = final_score >= DECISION_THRESHOLD
+
+    return {
+        "final_verdict": "LIVENESS CONFIRMED" if is_live else "LIVENESS DENIED",
+        "score": final_score,
+        "details": {
+            "motion": {
+                "score": motion_score,
+                "label": "REAL" if motion_score >= DECISION_THRESHOLD else "SPOOF"
+            },
+            "vision": {
+                "score": vision_score,
+                "label": "LIVE" if vision_score >= DECISION_THRESHOLD else "SPOOF"
+            }
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

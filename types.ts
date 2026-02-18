@@ -1,60 +1,51 @@
+// types.ts
+
+export type Scenario = 'Normal' | 'LowLight';
+
+// โครงสร้างข้อมูล Sensor (เหมือนเดิม)
+export interface SensorValue {
+  x: number | null;
+  y: number | null;
+  z: number | null;
+}
 
 export interface SensorData {
-  accel: { x: number | null; y: number | null; z: number | null };
-  gyro: { x: number | null; y: number | null; z: number | null };
+  accel: SensorValue;
+  gyro: SensorValue;
 }
 
-export interface OpticalFlowStats {
-  count: number;
-  avgX: number;
-  avgY: number;
-  avgMag: number;
-  variance: number;
-}
-
-export interface MotionAnalysis {
-  face_dx: number;
-  face_dy: number;
-  bg_dx: number;
-  bg_dy: number;
-  relative_magnitude: number;
-}
-
+// โครงสร้าง Frame ที่เปลี่ยนไป (faceMesh เป็น number[] ตาม data.json)
 export interface FrameData {
   timestamp: number;
-  faceMesh: number[];
+  faceMesh: number[]; // เปลี่ยนจาก Object เป็น Array ของตัวเลข [x1, y1, z1, x2, ...]
   sensors: SensorData;
-  opticalFlowStats: OpticalFlowStats;
-  motion_analysis: MotionAnalysis;
-  bg_variance: number;
-  image?: string; // Optional: As per original JSON structure
-  meta?: { camera_facing: string }; // Optional: As per original JSON structure
 }
 
+// โครงสร้าง JSON ที่จะส่งไป Backend
 export interface LivenessData {
   type: string;
   scenario: string;
   motion: string;
   data: FrameData[];
+  meta?: {
+    userAgent: string;
+  };
 }
 
-export interface MotionModelResult {
-  status: string;
-  label: 'REAL' | 'SPOOF';
-  score: number;
-  confidence: string;
-  message?: string;
-}
-
-export interface VisionModelResult {
-  status: string;
-  label: 'LIVE' | 'SPOOF';
-  score: number;
-  message?: string;
-}
-
+// โครงสร้าง Response จาก Backend
 export interface LivenessApiResponse {
-  motion_model: MotionModelResult;
-  vision_model: VisionModelResult;
-  final_verdict: 'LIVENESS CONFIRMED' | 'LIVENESS DENIED';
+  final_verdict: string;
+  details: {
+    motion: {
+      score: number;
+      passed: boolean;
+      label: 'REAL' | 'SPOOF';
+    };
+    vision: {
+      score: number;
+      passed: boolean;
+      label: 'LIVE' | 'SPOOF';
+    };
+  };
+  error?: string;
 }

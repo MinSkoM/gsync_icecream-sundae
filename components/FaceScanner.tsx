@@ -1,241 +1,242 @@
-
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import * as tf from '@tensorflow/tfjs';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
-import { LivenessData, FrameData, SensorData } from '../types';
+import { LivenessData, SensorData } from '../types'; 
+// หมายเหตุ: ตรวจสอบ types.ts ของคุณให้รองรับ structure นี้ หรือใช้ any ชั่วคราวได้ครับ
 
 interface FaceScannerProps {
-  onScanComplete: (data: LivenessData, blob: Blob) => void;
+  onScanComplete: (data: any, blob: Blob) => void; // ใช้ any เพื่อความยืดหยุ่นกับ JSON structure
   onCancel: () => void;
 }
 
 const MAX_FRAMES = 80;
-const FACE_LANDMARKS = 28; // As required by the Python model logic
+// จุด Landmark สำคัญ 3 จุด (จมูก, ตาซ้าย, ตาขวา) -> รวม 9 ค่า (x,y,z)
+// ต้องเรียงลำดับตามนี้เพื่อให้ตรงกับโมเดล Motion
+const SELECTED_LANDMARKS = [1, 33, 263]; 
 
 const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const frameCountRef = useRef(0);
-  const capturedFramesRef = useRef<FrameData[]>([]);
-  const sensorDataRef = useRef<SensorData>({
-    accel: { x: null, y: null, z: null },
-    gyro: { x: null, y: null, z: null },
-  });
-  // FIX: Initialize useRef with null to avoid potential errors with older @types/react versions.
-  const animationFrameIdRef = useRef<number | null>(null);
-  const [status, setStatus] = useState('Initializing...');
   
-  const prevFaceCentroidRef = useRef<{x: number, y: number, z: number} | null>(null);
-  const prevTimestampRef = useRef<number | null>(null);
+  // Buffer สำหรับเก็บข้อมูล JSON
+  const collectedFramesRef = useRef<any[]>([]); 
+  const isRecordingRef = useRef(false);
+  const animationFrameIdRef = useRef<number | null>(null);
+  
+  const [status, setStatus] = useState('Initializing AI...');
+  const [progress, setProgress] = useState(0);
 
-  const handleDeviceMotion = useCallback((event: DeviceMotionEvent) => {
-    sensorDataRef.current = {
-      accel: event.accelerationIncludingGravity ? {
-        x: event.accelerationIncludingGravity.x,
-        y: event.accelerationIncludingGravity.y,
-        z: event.accelerationIncludingGravity.z,
-      } : { x: 0, y: 0, z: 0 },
-      gyro: event.rotationRate ? {
-        x: event.rotationRate.alpha,
-        y: event.rotationRate.beta,
-        z: event.rotationRate.gamma,
-      } : { x: 0, y: 0, z: 0 },
+  // Sensor Store (เก็บค่าล่าสุดแบบ Real-time)
+  const sensorRef = useRef<SensorData>({
+    accel: { x: 0, y: 0, z: 0 },
+    gyro: { x: 0, y: 0, z: 0 },
+  });
+
+  // 1. Setup Sensors (Accelerometer & Gyroscope)
+  useEffect(() => {
+    const handleMotion = (event: DeviceMotionEvent) => {
+      if (event.accelerationIncludingGravity) {
+        sensorRef.current.accel = {
+          x: event.accelerationIncludingGravity.x || 0,
+          y: event.accelerationIncludingGravity.y || 0,
+          z: event.accelerationIncludingGravity.z || 0,
+        };
+      }
+      if (event.rotationRate) {
+        sensorRef.current.gyro = {
+          x: event.rotationRate.alpha || 0,
+          y: event.rotationRate.beta || 0,
+          z: event.rotationRate.gamma || 0,
+        };
+      }
     };
+
+    // Permission Request for iOS 13+
+    const setupSensors = async () => {
+        if (typeof (DeviceMotionEvent as any).requestPermission === 'function') {
+            try {
+                const permissionState = await (DeviceMotionEvent as any).requestPermission();
+                if (permissionState === 'granted') {
+                    window.addEventListener('devicemotion', handleMotion);
+                }
+            } catch (error) {
+                console.error("Sensor permission error:", error);
+            }
+        } else {
+            window.addEventListener('devicemotion', handleMotion);
+        }
+    };
+
+    setupSensors();
+    return () => window.removeEventListener('devicemotion', handleMotion);
   }, []);
 
-  const cleanup = useCallback(() => {
-    if (animationFrameIdRef.current) {
-      cancelAnimationFrame(animationFrameIdRef.current);
-    }
-    window.removeEventListener('devicemotion', handleDeviceMotion);
-    if (videoRef.current?.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
-    }
-  }, [handleDeviceMotion]);
-
+  // 2. Setup Camera & AI Model
   useEffect(() => {
-    const setup = async () => {
-      try {
-        await tf.setBackend('webgl');
-        
-        // Permission is now handled by the parent component before this mounts.
-        // We just attach the listener.
-        window.addEventListener('devicemotion', handleDeviceMotion);
-        
-        setStatus('Setting up camera...');
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480 },
-          audio: false,
-        });
-
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
+    const runFaceMesh = async () => {
+      await tf.ready();
+      const model = await faceLandmarksDetection.createDetector(
+        faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
+        {
+          runtime: 'tfjs',
+          refineLandmarks: true,
+          maxFaces: 1,
         }
-
-        setStatus('Loading face model...');
-        const model = await faceLandmarksDetection.createDetector(
-          faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
-          {
-            runtime: 'tfjs', // Using tfjs runtime to avoid MediaPipe loading issues.
-            refineLandmarks: true, 
-          }
-        );
-        
-        setStatus('Waiting to start scan...');
-        startScan(model, stream);
-
-      } catch (error) {
-        console.error("Setup failed:", error);
-        setStatus(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        cleanup();
-      }
+      );
+      setStatus('Ready. Hold still.');
+      startVideo(model);
     };
+    runFaceMesh();
+  }, []);
 
-    setup();
-    return cleanup;
-  }, [cleanup, handleDeviceMotion]);
-
-  const startScan = (model: faceLandmarksDetection.FaceLandmarksDetector, stream: MediaStream) => {
-    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'video/webm' });
-    mediaRecorderRef.current.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        recordedChunksRef.current.push(event.data);
-      }
-    };
-    mediaRecorderRef.current.onstop = () => {
-        const videoBlob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-        const finalData: LivenessData = {
-            type: "REAL", // Assuming real for capture, backend will verify
-            scenario: "Normal",
-            motion: "orbital_LR", // Example value
-            data: capturedFramesRef.current,
+  const startVideo = (model: faceLandmarksDetection.FaceLandmarksDetector) => {
+    navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'user', width: 640, height: 480 }, 
+        audio: false 
+    }).then((stream) => {
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.onloadeddata = () => {
+            startRecording(stream);
+            scanFrame(model);
         };
-        onScanComplete(finalData, videoBlob);
-    };
-    mediaRecorderRef.current.start();
-    frameCountRef.current = 0;
-    capturedFramesRef.current = [];
-    scanFrame(model);
+      }
+    });
   };
-  
-  const scanFrame = async (model: faceLandmarksDetection.FaceLandmarksDetector) => {
-    if (frameCountRef.current >= MAX_FRAMES) {
-      setStatus('Scan complete. Finalizing...');
-      cleanup();
-      return;
+
+  const startRecording = (stream: MediaStream) => {
+    isRecordingRef.current = true;
+    recordedChunksRef.current = [];
+    collectedFramesRef.current = []; 
+
+    // Setup MediaRecorder
+    const options = { mimeType: 'video/mp4' };
+    try {
+        mediaRecorderRef.current = new MediaRecorder(stream, MediaRecorder.isTypeSupported('video/mp4') ? options : undefined);
+    } catch (e) {
+        mediaRecorderRef.current = new MediaRecorder(stream);
     }
 
-    if (videoRef.current && videoRef.current.readyState === 4) {
-      // FIX: The estimateFaces method now takes the video element directly.
-      const faces = await model.estimateFaces(videoRef.current);
-      
-      if (faces.length > 0) {
-        const keypoints = faces[0].keypoints.slice(0, FACE_LANDMARKS);
-        const faceMesh = keypoints.flatMap(p => [p.x / 640, p.y / 480, p.z ?? 0]);
+    mediaRecorderRef.current.ondataavailable = (event) => {
+      if (event.data.size > 0) recordedChunksRef.current.push(event.data);
+    };
 
-        const currentTimestamp = performance.now();
-        const dt = prevTimestampRef.current ? (currentTimestamp - prevTimestampRef.current) / 1000 : 1 / 30;
-
-        // FIX: Ensure 'z' property is handled correctly, resolving potential type errors by providing a fallback value.
-        // FIX: Explicitly type the accumulator in the reduce function to ensure `currentCentroid` has the correct type with a non-optional `z` property, resolving the assignment error.
-        const currentCentroid = keypoints.reduce((acc: {x: number, y: number, z: number}, p) => ({x: acc.x + p.x, y: acc.y + p.y, z: acc.z + (p.z ?? 0)}), {x:0, y:0, z:0});
-        currentCentroid.x /= keypoints.length;
-        currentCentroid.y /= keypoints.length;
-        currentCentroid.z /= keypoints.length;
-
-        let face_dx = 0, face_dy = 0;
-        if(prevFaceCentroidRef.current) {
-            face_dx = (currentCentroid.x - prevFaceCentroidRef.current.x) / dt;
-            face_dy = (currentCentroid.y - prevFaceCentroidRef.current.y) / dt;
-        }
+    mediaRecorderRef.current.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/mp4' });
         
-        // Lightweight proxy for background motion using gyroscope
-        const gyro = sensorDataRef.current.gyro;
-        const bg_dx = (gyro.y || 0) * -5; // Gyro Y-axis rotation approximates horizontal motion
-        const bg_dy = (gyro.x || 0) * 5;  // Gyro X-axis rotation approximates vertical motion
-
-        const faceMagnitude = Math.sqrt(face_dx**2 + face_dy**2);
-        const bgMagnitude = Math.sqrt(bg_dx**2 + bg_dy**2);
-
-        const frame: FrameData = {
-          timestamp: Date.now(),
-          faceMesh: faceMesh,
-          sensors: JSON.parse(JSON.stringify(sensorDataRef.current)), // Deep copy
-          opticalFlowStats: {
-            count: 30, // Dummy value
-            avgX: bg_dx,
-            avgY: bg_dy,
-            avgMag: bgMagnitude,
-            variance: Math.abs(gyro.z || 0) * 0.1, // Proxy variance from Z-axis rotation
-          },
-          motion_analysis: {
-            face_dx,
-            face_dy,
-            bg_dx,
-            bg_dy,
-            relative_magnitude: Math.abs(faceMagnitude - bgMagnitude),
-          },
-          bg_variance: Math.abs(gyro.z || 0) * 0.1,
-          meta: { camera_facing: "user" }
+        // Construct Final JSON (Structure เดียวกับ data.json)
+        const finalData = {
+            type: "UNKNOWN",
+            scenario: "Production",
+            motion: "unknown",
+            data: collectedFramesRef.current, // Array of frames
+            meta: {
+                userAgent: navigator.userAgent
+            }
         };
-        capturedFramesRef.current.push(frame);
-        
-        prevFaceCentroidRef.current = currentCentroid;
-        prevTimestampRef.current = currentTimestamp;
-        
-        frameCountRef.current++;
-        setStatus(`Scanning... ${frameCountRef.current}/${MAX_FRAMES}`);
+        onScanComplete(finalData, blob);
+    };
 
-        // Draw on canvas
-        if (canvasRef.current) {
-          const ctx = canvasRef.current.getContext('2d');
-          if (ctx) {
-            ctx.clearRect(0, 0, 640, 480);
-            ctx.fillStyle = 'rgba(0, 255, 0, 0.7)';
-            keypoints.forEach(point => {
-              ctx.beginPath();
-              ctx.arc(point.x, point.y, 2, 0, 2 * Math.PI);
-              ctx.fill();
-            });
-          }
-        }
-      } else {
-        if (canvasRef.current) {
-          const ctx = canvasRef.current.getContext('2d');
-          ctx?.clearRect(0, 0, 640, 480);
-        }
-      }
-    }
+    mediaRecorderRef.current.start();
+    setStatus('Scanning...');
+  };
+
+  const scanFrame = async (model: faceLandmarksDetection.FaceLandmarksDetector) => {
+    if (!videoRef.current || !canvasRef.current || !isRecordingRef.current) return;
+
+    // Detect Face
+    const faces = await model.estimateFaces(videoRef.current, { flipHorizontal: false });
     
+    // Draw Feedback
+    const ctx = canvasRef.current.getContext('2d');
+    if (ctx) {
+        ctx.clearRect(0, 0, 640, 480);
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.translate(-640, 0);
+        
+        if (faces.length > 0) {
+            const face = faces[0];
+            const timestamp = Date.now();
+            const width = videoRef.current.videoWidth;
+            const height = videoRef.current.videoHeight;
+
+            // --- Extract & Normalize Landmarks ---
+            // เราต้องการ 9 ค่า (x,y,z ของ 3 จุด) แบบ Flat Array
+            const flatFaceMesh: number[] = [];
+            
+            SELECTED_LANDMARKS.forEach(index => {
+                const p = face.keypoints[index];
+                // Normalize ให้เป็น 0.0 - 1.0 ตาม data.json
+                flatFaceMesh.push(p.x / width);  
+                flatFaceMesh.push(p.y / height);
+                // Z ใน TFJS เป็น pixel scale ประมาณการ, หาร width เพื่อ normalize คร่าวๆ
+                flatFaceMesh.push((p as any).z ? (p as any).z / width : 0); 
+                
+                // Draw debug points
+                ctx.fillStyle = '#00FF00';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 3, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+
+            // Push Data Frame
+            collectedFramesRef.current.push({
+                timestamp: timestamp,
+                faceMesh: flatFaceMesh, // [x1,y1,z1, x2,y2,z2, x3,y3,z3]
+                sensors: {
+                    accel: { ...sensorRef.current.accel },
+                    gyro: { ...sensorRef.current.gyro }
+                }
+            });
+
+            // Update Progress
+            const progressVal = (collectedFramesRef.current.length / MAX_FRAMES) * 100;
+            setProgress(progressVal);
+
+            if (collectedFramesRef.current.length >= MAX_FRAMES) {
+                isRecordingRef.current = false;
+                mediaRecorderRef.current?.stop();
+                return; 
+            }
+        }
+        ctx.restore();
+    }
+
     animationFrameIdRef.current = requestAnimationFrame(() => scanFrame(model));
   };
 
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
+      if (videoRef.current && videoRef.current.srcObject) {
+        (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
 
   return (
     <div className="flex flex-col items-center gap-4 w-full">
-      <div className="relative w-full max-w-sm sm:max-w-md aspect-[4/3] rounded-lg overflow-hidden shadow-lg border-2 border-indigo-500">
+      <div className="relative w-full max-w-sm aspect-[3/4] rounded-lg overflow-hidden shadow-2xl border-2 border-indigo-500 bg-black">
         <video ref={videoRef} autoPlay playsInline muted className="absolute inset-0 w-full h-full object-cover transform -scale-x-100" />
-        <canvas ref={canvasRef} width="640" height="480" className="absolute inset-0 w-full h-full transform -scale-x-100" />
-        <div className="absolute bottom-0 left-0 right-0 bg-black/50 p-2 text-center">
-          <p className="font-semibold text-lg">{status}</p>
-          <div className="w-full bg-gray-600 rounded-full h-2.5 mt-2">
-            <div className="bg-indigo-500 h-2.5 rounded-full" style={{ width: `${(frameCountRef.current / MAX_FRAMES) * 100}%` }}></div>
+        <canvas ref={canvasRef} width="640" height="480" className="absolute inset-0 w-full h-full" />
+        
+        {/* UI Overlay */}
+        <div className="absolute bottom-0 left-0 right-0 bg-black/70 p-4 text-center backdrop-blur-sm">
+          <p className="font-semibold text-lg text-white mb-2">{status}</p>
+          <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
+            <div 
+                className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full transition-all duration-100 ease-linear" 
+                style={{ width: `${progress}%` }} 
+            />
           </div>
+          <p className="text-xs text-gray-400 mt-1">{Math.round(progress)}%</p>
         </div>
       </div>
-       <button
-        onClick={onCancel}
-        className="w-full max-w-sm bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-4 rounded-lg transition"
-      >
-        Cancel Scan
-      </button>
+      <button onClick={onCancel} className="text-gray-400 hover:text-white mt-2">Cancel</button>
     </div>
   );
 };
