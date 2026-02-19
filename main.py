@@ -48,12 +48,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONFIG ---
+# ==========================================
+# ⚙️ CONFIGURATION (นำมาจาก preall.py)
+# ==========================================
 MAX_SEQ_LENGTH = 80
 NUM_LANDMARKS = 9
-# ตามไฟล์ preall.py และ training script
-SMOOTH_SPAN = 3 
-DECISION_THRESHOLD = 0.5 # ปรับได้ตามความเหมาะสม
+NUM_SENSORS = 6
+NUM_BG = 6
+
+GATE_THRESHOLD = 3.0
+ENABLE_SMOOTHING = True
+SMOOTH_SPAN = 3
+DECISION_THRESHOLD = 0.5
 
 # --- LOAD MODELS ---
 try:
@@ -69,74 +75,116 @@ except Exception as e:
     motion_model = None
     vision_model = None
 
+
+# ==========================================
+# 🛠️ PRE-PROCESSING FOR FUSION (ถอดแบบ preall.py)
+# ==========================================
+def process_signal_data(data_seq):
+    """ทำ Normalization ด้วย Z-Score (ใช้ Median และ IQR เหมือนตอนเทรน)"""
+    if not isinstance(data_seq, (list, np.ndarray)) or len(data_seq) == 0:
+        return np.zeros((MAX_SEQ_LENGTH, 1))
+    
+    df = pd.DataFrame(data_seq)
+    if ENABLE_SMOOTHING: 
+        df = df.ewm(span=SMOOTH_SPAN, adjust=False).mean()
+    
+    vals = df.astype(float).fillna(0.0).values
+    median = np.median(vals, axis=0)
+    q75, q25 = np.percentile(vals, [75, 25], axis=0)
+    iqr = q75 - q25
+    iqr[iqr == 0] = 1.0  # ป้องกันหาร 0
+    
+    normalized = (vals - median) / iqr
+    return np.clip(normalized, -4.0, 4.0)
+
 def preprocess_motion(json_data):
-    """
-    Logic เดียวกับ preall.py:
-    1. Extract faceMesh (9 points) & sensors (6 values)
-    2. Exponential Smoothing (span=3)
-    3. Z-Score Normalization (per sequence)
-    4. Padding/Truncate to 80 frames
-    """
     frames = json_data.get('data', [])
-    if not frames:
+    if not frames: 
         raise ValueError("No frames in JSON")
-
-    lm_seq = []
-    sn_seq = []
-
-    for frame in frames:
-        # Extract Landmarks (Flat list)
-        mesh = frame.get('faceMesh', [])
-        if len(mesh) < NUM_LANDMARKS:
-            mesh += [0.0] * (NUM_LANDMARKS - len(mesh))
-        lm_seq.append(mesh[:NUM_LANDMARKS])
-
-        # Extract Sensors
-        s = frame.get('sensors', {})
-        acc = s.get('accel', {'x':0, 'y':0, 'z':0})
-        gyr = s.get('gyro', {'x':0, 'y':0, 'z':0})
-        # เช็ค null
-        ax = acc['x'] if acc['x'] is not None else 0
-        ay = acc['y'] if acc['y'] is not None else 0
-        az = acc['z'] if acc['z'] is not None else 0
-        gx = gyr['x'] if gyr['x'] is not None else 0
-        gy = gyr['y'] if gyr['y'] is not None else 0
-        gz = gyr['z'] if gyr['z'] is not None else 0
+    
+    # 1. เช็ค Gate Threshold สำหรับ Background
+    all_vars = [f.get('bg_variance', 0) for f in frames]
+    is_gate_open = np.mean(all_vars) >= GATE_THRESHOLD if all_vars else False
+    
+    lm_seq, sn_seq, bg_seq = [], [], []
+    prev_lm = None
+    
+    for f in frames:
+        meta = f.get('meta', {}) or {}
+        mult = -1 if meta.get('camera_facing') == 'environment' else 1
         
-        sn_seq.append([ax, ay, az, gx, gy, gz])
+        # --- จัดการ Landmarks (คำนวณ Delta หรือความแตกต่างระหว่างเฟรม) ---
+        raw_lm = f.get('faceMesh')
+        if not raw_lm: 
+            continue
+            
+        lm_array = np.array(raw_lm)
+        if len(lm_array) == NUM_LANDMARKS:
+            # ถ้าส่งมาแค่ 9 ค่า (3 จุด) พอดี
+            curr_face_features = lm_array
+        else:
+            # ถ้าส่ง FaceMesh แบบเต็มมา
+            lm_matrix = lm_array.reshape(-1, 3)
+            nose = lm_matrix[8] if len(lm_matrix) > 8 else [0,0,0]
+            left_eye = lm_matrix[12] if len(lm_matrix) > 12 else [0,0,0]
+            right_eye = lm_matrix[16] if len(lm_matrix) > 16 else [0,0,0]
+            curr_face_features = np.concatenate([nose, left_eye, right_eye])
+        
+        # คำนวณ Delta
+        if prev_lm is None:
+            d_lm = np.zeros_like(curr_face_features)
+        else:
+            d_lm = curr_face_features - prev_lm
+        
+        lm_seq.append(d_lm)
+        prev_lm = curr_face_features
 
-    # Convert to DF for Smoothing
-    lm_df = pd.DataFrame(lm_seq)
-    sn_df = pd.DataFrame(sn_seq)
+        # --- จัดการ Sensors ---
+        s = f.get('sensors', {}) or {}
+        a = s.get('accel') or {}
+        g = s.get('gyro') or {}
+        
+        def sf(x): return float(x) if x is not None else 0.0
+        
+        sn_seq.append([sf(a.get('x')), sf(a.get('y')), sf(a.get('z'))*mult,
+                       sf(g.get('x')), sf(g.get('y')), sf(g.get('z'))])
 
-    # 1. Smoothing
-    lm_smooth = lm_df.ewm(span=SMOOTH_SPAN, adjust=False).mean().values
-    sn_smooth = sn_df.ewm(span=SMOOTH_SPAN, adjust=False).mean().values
+        # --- จัดการ Background ---
+        if is_gate_open:
+            m = f.get('motion_analysis', {}) or {}
+            bg_seq.append([sf(m.get('face_dx')), sf(m.get('face_dy')),
+                           sf(m.get('bg_dx')), sf(m.get('bg_dy')),
+                           sf(m.get('relative_magnitude')), sf(f.get('bg_variance'))])
+        else: 
+            bg_seq.append([0.0] * NUM_BG)
+    
+    if len(lm_seq) < 5: 
+        raise ValueError("Too few frames for analysis")
+        
+    # 2. ทำ Normalization (IQR/Median) แบบเดียวกับ preall.py
+    X_lm = process_signal_data(np.array(lm_seq))
+    X_sn = process_signal_data(np.array(sn_seq))
+    X_bg = process_signal_data(np.array(bg_seq))
 
-    # 2. Normalization (Z-Score per sample)
-    lm_mean = np.mean(lm_smooth, axis=0)
-    lm_std = np.std(lm_smooth, axis=0) + 1e-6
-    lm_norm = (lm_smooth - lm_mean) / lm_std
-
-    sn_mean = np.mean(sn_smooth, axis=0)
-    sn_std = np.std(sn_smooth, axis=0) + 1e-6
-    sn_norm = (sn_smooth - sn_mean) / sn_std
-
-    # 3. Padding / Truncating
-    curr_len = len(lm_norm)
-    if curr_len < MAX_SEQ_LENGTH:
-        pad_len = MAX_SEQ_LENGTH - curr_len
-        lm_final = np.pad(lm_norm, ((0, pad_len), (0, 0)), mode='constant')
-        sn_final = np.pad(sn_norm, ((0, pad_len), (0, 0)), mode='constant')
-    else:
-        lm_final = lm_norm[:MAX_SEQ_LENGTH]
-        sn_final = sn_norm[:MAX_SEQ_LENGTH]
-
+    # 3. Crop/Pad ให้ได้ความยาว 80 เฟรมเป๊ะๆ
+    def crop_pad(arr):
+        if len(arr) > MAX_SEQ_LENGTH:
+            start = (len(arr) - MAX_SEQ_LENGTH) // 2
+            return arr[start : start + MAX_SEQ_LENGTH]
+        elif len(arr) < MAX_SEQ_LENGTH:
+            return np.vstack((arr, np.zeros((MAX_SEQ_LENGTH - len(arr), arr.shape[1]))))
+        return arr
+        
+    # คืนค่าเป็น Dictionary ให้ Model .predict()
     return {
-        "lm": np.expand_dims(lm_final, axis=0), 
-        "sn": np.expand_dims(sn_final, axis=0)
+        "lm": np.expand_dims(crop_pad(X_lm), axis=0),
+        "sn": np.expand_dims(crop_pad(X_sn), axis=0),
+        "bg": np.expand_dims(crop_pad(X_bg), axis=0)
     }
 
+# ==========================================
+# 📷 VISION MODEL PROCESSING
+# ==========================================
 def process_video_frames(video_path):
     """
     ดึงเฟรมจากวิดีโอมา 5 เฟรม (กระจายทั่วคลิป) เพื่อส่งเข้า Vision Model
@@ -147,7 +195,6 @@ def process_video_frames(video_path):
     if total_frames < 1:
         return np.array([])
 
-    # เลือก 5 เฟรม กระจายๆ กัน
     indices = np.linspace(0, total_frames - 1, 5, dtype=int)
     batch_images = []
 
@@ -155,15 +202,16 @@ def process_video_frames(video_path):
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if ret:
-            # Resize 224x224
             frame = cv2.resize(frame, (224, 224))
-            # Convert BGR to RGB (เพราะ OpenCV อ่านเป็น BGR)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             batch_images.append(frame)
     
     cap.release()
     return np.array(batch_images) # (N, 224, 224, 3)
 
+# ==========================================
+# 🌐 API ENDPOINT
+# ==========================================
 @app.post("/api/predict/liveness")
 async def predict(
     video_file: UploadFile = File(...), 
@@ -185,23 +233,19 @@ async def predict(
         
     except Exception as e:
         logger.error(f"Motion Error: {e}")
-        # ถ้าพัง ให้คะแนนต่ำสุด
         motion_score = 0.0
 
     # --- 2. VISION PREDICTION ---
     vision_score = 0.0
     try:
-        # Save video temp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(await video_file.read())
             tmp_path = tmp.name
         
         frames = process_video_frames(tmp_path)
-        os.unlink(tmp_path) # ลบไฟล์ทิ้ง
+        os.unlink(tmp_path) 
 
         if len(frames) > 0:
-            # Model Vision มี Rescaling layer อยู่ข้างในแล้ว (scale=1/127.5)
-            # ดังนั้นส่งค่า 0-255 ไปได้เลย ไม่ต้องหารเอง
             v_preds = vision_model.predict(frames)
             vision_score = float(np.mean(v_preds))
             logger.info(f"👁️ Vision Score: {vision_score}")
@@ -211,9 +255,6 @@ async def predict(
         vision_score = 0.0
 
     # --- 3. FUSION LOGIC ---
-    # ใช้ Weighted Average แบบเดียวกับ preall.py
-    # (vision * 0.4) + (motion * 0.6)
-    
     final_score = (vision_score * 0.4) + (motion_score * 0.6)
     is_live = final_score >= DECISION_THRESHOLD
 
