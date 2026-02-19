@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { LivenessApiResponse } from '../types';
 import { CheckCircleIcon, XCircleIcon, ShieldCheckIcon, ShieldExclamationIcon } from './icons';
@@ -23,8 +22,10 @@ const ResultCard: React.FC<{ title: string; label: string; score: number; isSucc
 
 const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ results, onReset }) => {
   const isFinalSuccess = results.final_verdict === 'LIVENESS CONFIRMED';
-  const motionSuccess = results.motion_model.label === 'REAL';
-  const visionSuccess = results.vision_model.label === 'LIVE';
+  
+  // ✅ แก้ไข: เรียกผ่าน results.details ให้ตรงกับที่ Backend ส่งมา
+  const motionSuccess = results.details?.motion?.label === 'REAL';
+  const visionSuccess = results.details?.vision?.label === 'LIVE';
 
   return (
     <div className="w-full flex flex-col items-center gap-6 text-center">
@@ -39,16 +40,18 @@ const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ results, onReset }) => 
       </h2>
 
       <div className="w-full space-y-4 text-left">
+        {/* ✅ แก้ไข: ดึงข้อมูลจาก results.details.motion */}
         <ResultCard 
           title="Motion Analysis"
-          label={results.motion_model.label}
-          score={results.motion_model.score}
+          label={results.details?.motion?.label || 'UNKNOWN'}
+          score={results.details?.motion?.score || 0}
           isSuccess={motionSuccess}
         />
+        {/* ✅ แก้ไข: ดึงข้อมูลจาก results.details.vision */}
         <ResultCard 
           title="Vision Analysis"
-          label={results.vision_model.label}
-          score={results.vision_model.score}
+          label={results.details?.vision?.label || 'UNKNOWN'}
+          score={results.details?.vision?.score || 0}
           isSuccess={visionSuccess}
         />
       </div>

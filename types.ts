@@ -35,16 +35,15 @@ export interface LivenessData {
 // โครงสร้าง Response จาก Backend
 export interface LivenessApiResponse {
   final_verdict: string;
+  score: number; // ✅ เพิ่ม score รูทรวม (final_score) ที่ Backend ส่งมา
   details: {
     motion: {
       score: number;
-      passed: boolean;
-      label: 'REAL' | 'SPOOF';
+      label: 'REAL' | 'SPOOF'; // ✅ ลบ passed ออกเพราะ Backend ส่งมาแค่ score กับ label
     };
     vision: {
       score: number;
-      passed: boolean;
-      label: 'LIVE' | 'SPOOF';
+      label: 'LIVE' | 'SPOOF'; // ✅ ลบ passed ออกเช่นกัน
     };
   };
   error?: string;
