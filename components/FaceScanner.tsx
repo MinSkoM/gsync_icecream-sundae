@@ -8,7 +8,7 @@ interface FaceScannerProps {
   onCancel: () => void;
 }
 
-const MAX_FRAMES = 80;
+const MAX_FRAMES = 120;
 const SELECTED_LANDMARKS = [1, 33, 263]; 
 
 const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) => {
