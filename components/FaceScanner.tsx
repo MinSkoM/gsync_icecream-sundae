@@ -60,12 +60,12 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
   }, []);
 
   // --- 2. FAST INITIALIZATION LOGIC ---
+  // --- 2. FAST INITIALIZATION LOGIC ---
   useEffect(() => {
     let active = true;
 
     const setupApp = async () => {
       try {
-        // 🔥 STEP A: ตั้งค่า Backend และโหลดกล้องไปพร้อมกัน (Parallel)
         const [_, stream] = await Promise.all([
           tf.setBackend('webgl').then(() => tf.ready()),
           navigator.mediaDevices.getUserMedia({ 
@@ -76,12 +76,18 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
 
         if (!active) return;
 
-        // แสดงภาพจากกล้องทันทีแม้ AI จะยังโหลดไม่เสร็จ (ลดความรู้สึกว่าเครื่องค้าง)
+        // 🔥 สำคัญ: ต้องรอให้วิดีโอโหลดภาพเฟรมแรกเสร็จก่อน ไม่งั้น AI จะพัง (Error 0x0)
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          await new Promise<void>((resolve) => {
+            if (videoRef.current) {
+              videoRef.current.onloadeddata = () => resolve();
+            } else {
+              resolve();
+            }
+          });
         }
 
-        // 🔥 STEP B: โหลด Detector โดยใช้ Mediapipe Runtime (เร็วกว่า TFJS runtime มาก)
         const detector = await faceLandmarksDetection.createDetector(
           faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
           {
@@ -95,8 +101,8 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
         if (!active) return;
         detectorRef.current = detector;
 
-        // 🔥 STEP C: Warm-up Model (รันรอบแรกทิ้งเพื่อให้รอบจริงไม่กระตุก)
-        if (videoRef.current) {
+        // 🔥 ป้องกันซ้อนอีกชั้น: Warm-up เฉพาะตอนที่ขนาดวิดีโอ > 0
+        if (videoRef.current && videoRef.current.videoWidth > 0) {
             await detector.estimateFaces(videoRef.current);
         }
 
@@ -141,38 +147,56 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
   };
 
   const scanFrame = async () => {
-    if (!videoRef.current || !canvasRef.current || !isRecordingRef.current || !detectorRef.current) {
-      // ถ้าตัวแปรไม่ครบ ให้ Log ดูว่าขาดอะไร
-      console.log("Waiting for components...", { 
-        video: !!videoRef.current, 
-        isRecording: isRecordingRef.current, 
-        detector: !!detectorRef.current 
-      });
-      return;
+    // เพิ่มการเช็ค videoWidth === 0 และพร้อมใช้งานหรือไม่
+    if (!videoRef.current || !canvasRef.current || !isRecordingRef.current || !detectorRef.current || videoRef.current.videoWidth === 0) {
+        animationFrameIdRef.current = requestAnimationFrame(scanFrame);
+        return;
     }
 
-    const faces = await detectorRef.current.estimateFaces(videoRef.current, { flipHorizontal: false });
-    
-    // --- เพิ่ม Log ตรงนี้ ---
-    if (faces.length === 0) {
-      console.warn("No face detected! Please show your face to the camera.");
-      // อัปเดต Status บอกผู้ใช้
-      setStatus('Scanning... (No face detected)');
-    } else {
-      if (status !== 'Scanning...') setStatus('Scanning...');
-    }
-    // ----------------------
-
-    const ctx = canvasRef.current.getContext('2d');
-    if (ctx && faces.length > 0) {
-        // ... โค้ดส่วนประมวลผล Landmarks เดิม ...
+    try {
+        const faces = await detectorRef.current.estimateFaces(videoRef.current, { flipHorizontal: false });
+        const ctx = canvasRef.current.getContext('2d');
         
-        // ลอง Log ดูว่าเฟรมที่เท่าไหร่แล้ว
-        if (collectedFramesRef.current.length % 10 === 0) {
-          console.log(`Collected ${collectedFramesRef.current.length} frames`);
-        }
+        if (ctx && faces.length > 0) {
+            // ... (โค้ดเดิมทั้งหมดใน block นี้ปล่อยไว้เหมือนเดิมครับ) ...
+            const face = faces[0];
+            const width = videoRef.current.videoWidth;
+            const height = videoRef.current.videoHeight;
+            
+            ctx.clearRect(0, 0, 640, 480);
+            ctx.save();
+            ctx.scale(-1, 1);
+            ctx.translate(-640, 0);
 
-        // ... ส่วนที่เหลือของฟังก์ชัน ...
+            const flatFaceMesh: number[] = [];
+            SELECTED_LANDMARKS.forEach(index => {
+                const p = face.keypoints[index];
+                flatFaceMesh.push(p.x / width, p.y / height, (p as any).z ? (p as any).z / width : 0);
+                
+                ctx.fillStyle = '#6366f1';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 4, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+
+            collectedFramesRef.current.push({
+                timestamp: Date.now(),
+                faceMesh: flatFaceMesh,
+                sensors: { ...sensorRef.current }
+            });
+
+            const progressVal = (collectedFramesRef.current.length / MAX_FRAMES) * 100;
+            setProgress(progressVal);
+
+            if (collectedFramesRef.current.length >= MAX_FRAMES) {
+                isRecordingRef.current = false;
+                mediaRecorderRef.current?.stop();
+                return; 
+            }
+            ctx.restore();
+        }
+    } catch (e) {
+        console.warn("Frame skipped due to error: ", e);
     }
 
     animationFrameIdRef.current = requestAnimationFrame(scanFrame);
