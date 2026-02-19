@@ -1,38 +1,40 @@
-import { LivenessApiResponse, LivenessData } from '../types';
+import { LivenessData, LivenessApiResponse } from '../types';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/predict/liveness';
+// ดึง Base URL จาก Environment Variable (หรือระบุตรงๆ สำหรับทดสอบ)
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'https://malika-shedable-recollectively.ngrok-free.dev';
 
 export const predictLiveness = async (
-  videoBlob: Blob,
-  jsonData: LivenessData
+  videoBlob: Blob, 
+  livenessData: LivenessData
 ): Promise<LivenessApiResponse> => {
-  const formData = new FormData();
-  formData.append('video_file', videoBlob, 'scan.mp4');
   
-  const jsonBlob = new Blob([JSON.stringify(jsonData)], { type: 'application/json' });
+  const formData = new FormData();
+
+  // 1. ใส่ไฟล์วิดีโอ (ตั้งชื่อ key ให้ตรงกับ FastAPI: video_file)
+  formData.append('video_file', videoBlob, 'capture.mp4');
+
+  // 2. แปลง livenessData เป็น Blob (JSON) และใส่เข้าไป (ชื่อ key: json_file)
+  const jsonBlob = new Blob([JSON.stringify(livenessData)], { type: 'application/json' });
   formData.append('json_file', jsonBlob, 'data.json');
 
   try {
-    const response = await fetch(API_URL, {
+    const response = await fetch(`${API_BASE_URL}/api/predict/liveness`, {
       method: 'POST',
-      body: formData,
-      // 🔥 เพิ่ม headers ตรงนี้ เพื่อทะลุหน้า Warning ของ Ngrok
       headers: {
-        'ngrok-skip-browser-warning': 'true', 
+        // ✅ สำคัญ: เพื่อข้ามหน้า Browser Warning ของ Ngrok เมื่อเรียกผ่าน Web
+        'ngrok-skip-browser-warning': '69420',
       },
+      body: formData,
     });
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ detail: 'An unknown error occurred' }));
-      throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+      const errorData = await response.json();
+      throw new Error(errorData.detail || 'การส่งข้อมูลไปยังเซิร์ฟเวอร์ล้มเหลว');
     }
 
     return await response.json();
   } catch (error) {
-    console.error("API call failed:", error);
-    if (error instanceof Error) {
-        throw new Error(`Failed to get liveness prediction: ${error.message}`);
-    }
-    throw new Error('An unexpected error occurred during the API call.');
+    console.error('API Error:', error);
+    throw error;
   }
 };
