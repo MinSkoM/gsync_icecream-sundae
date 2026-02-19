@@ -1,6 +1,5 @@
 import { LivenessApiResponse, LivenessData } from '../types';
 
-// ✅ แก้ตรงนี้: ใช้ import.meta.env.VITE_API_URL สำหรับ Vite
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/predict/liveness';
 
 export const predictLiveness = async (
@@ -8,9 +7,8 @@ export const predictLiveness = async (
   jsonData: LivenessData
 ): Promise<LivenessApiResponse> => {
   const formData = new FormData();
-
   formData.append('video_file', videoBlob, 'scan.mp4');
-
+  
   const jsonBlob = new Blob([JSON.stringify(jsonData)], { type: 'application/json' });
   formData.append('json_file', jsonBlob, 'data.json');
 
@@ -18,6 +16,10 @@ export const predictLiveness = async (
     const response = await fetch(API_URL, {
       method: 'POST',
       body: formData,
+      // 🔥 เพิ่ม headers ตรงนี้ เพื่อทะลุหน้า Warning ของ Ngrok
+      headers: {
+        'ngrok-skip-browser-warning': 'true', 
+      },
     });
 
     if (!response.ok) {
