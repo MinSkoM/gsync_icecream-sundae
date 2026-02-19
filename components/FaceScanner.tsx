@@ -29,7 +29,7 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
     gyro: { x: 0, y: 0, z: 0 },
   });
 
-  // --- 1. SENSOR SETUP (เหมือนเดิมแต่อยู่ใน useEffect เดียวกันเพื่อความคลีน) ---
+  // --- 1. SENSOR SETUP ---
   useEffect(() => {
     const handleMotion = (event: DeviceMotionEvent) => {
       if (event.accelerationIncludingGravity) {
@@ -60,7 +60,6 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
   }, []);
 
   // --- 2. FAST INITIALIZATION LOGIC ---
-  // --- 2. FAST INITIALIZATION LOGIC ---
   useEffect(() => {
     let active = true;
 
@@ -69,19 +68,25 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
         const [_, stream] = await Promise.all([
           tf.setBackend('webgl').then(() => tf.ready()),
           navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: 'user', width: 640, height: 480 }, 
+            video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, 
             audio: false 
           })
         ]);
 
         if (!active) return;
 
-        // 🔥 สำคัญ: ต้องรอให้วิดีโอโหลดภาพเฟรมแรกเสร็จก่อน ไม่งั้น AI จะพัง (Error 0x0)
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           await new Promise<void>((resolve) => {
             if (videoRef.current) {
-              videoRef.current.onloadeddata = () => resolve();
+              videoRef.current.onloadeddata = () => {
+                // ✅ สำคัญที่ 1: ตั้งค่า Canvas ให้ความละเอียดเท่ากล้องเป๊ะๆ
+                if (canvasRef.current && videoRef.current) {
+                  canvasRef.current.width = videoRef.current.videoWidth;
+                  canvasRef.current.height = videoRef.current.videoHeight;
+                }
+                resolve();
+              };
             } else {
               resolve();
             }
@@ -101,7 +106,6 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
         if (!active) return;
         detectorRef.current = detector;
 
-        // 🔥 ป้องกันซ้อนอีกชั้น: Warm-up เฉพาะตอนที่ขนาดวิดีโอ > 0
         if (videoRef.current && videoRef.current.videoWidth > 0) {
             await detector.estimateFaces(videoRef.current);
         }
@@ -147,7 +151,6 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
   };
 
   const scanFrame = async () => {
-    // เพิ่มการเช็ค videoWidth === 0 และพร้อมใช้งานหรือไม่
     if (!videoRef.current || !canvasRef.current || !isRecordingRef.current || !detectorRef.current || videoRef.current.videoWidth === 0) {
         animationFrameIdRef.current = requestAnimationFrame(scanFrame);
         return;
@@ -158,15 +161,15 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
         const ctx = canvasRef.current.getContext('2d');
         
         if (ctx && faces.length > 0) {
-            // ... (โค้ดเดิมทั้งหมดใน block นี้ปล่อยไว้เหมือนเดิมครับ) ...
             const face = faces[0];
             const width = videoRef.current.videoWidth;
             const height = videoRef.current.videoHeight;
             
-            ctx.clearRect(0, 0, 640, 480);
+            // ✅ สำคัญที่ 2: ใช้ตัวแปร width, height แทนการระบุเลข 640, 480
+            ctx.clearRect(0, 0, width, height);
             ctx.save();
             ctx.scale(-1, 1);
-            ctx.translate(-640, 0);
+            ctx.translate(-width, 0);
 
             const flatFaceMesh: number[] = [];
             SELECTED_LANDMARKS.forEach(index => {
@@ -194,6 +197,11 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
                 return; 
             }
             ctx.restore();
+        } else if (ctx) {
+            // เคลียร์หน้าจอถ้าหาหน้าไม่เจอ
+            const width = videoRef.current.videoWidth;
+            const height = videoRef.current.videoHeight;
+            ctx.clearRect(0, 0, width, height);
         }
     } catch (e) {
         console.warn("Frame skipped due to error: ", e);
@@ -202,7 +210,6 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
     animationFrameIdRef.current = requestAnimationFrame(scanFrame);
   };
 
-  // Cleanup เหมือนเดิม...
   useEffect(() => {
     return () => {
       if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
@@ -214,10 +221,18 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
 
   return (
     <div className="flex flex-col items-center gap-4 w-full">
-      <div className="relative w-full max-w-sm aspect-[3/4] rounded-2xl overflow-hidden shadow-2xl border-4 border-indigo-500/30 bg-black">
-        <video ref={videoRef} autoPlay playsInline muted className="absolute inset-0 w-full h-full object-cover transform -scale-x-100" />
-        <canvas ref={canvasRef} width="640" height="480" className="absolute inset-0 w-full h-full pointer-events-none" />
-        
+      <div className="relative w-full max-w-sm aspect-[3/4] rounded-lg overflow-hidden shadow-2xl border-2 border-indigo-500 bg-black">
+        <video 
+          ref={videoRef} 
+          autoPlay 
+          playsInline 
+          muted 
+          className="absolute inset-0 w-full h-full object-cover transform -scale-x-100" 
+        />
+        <canvas 
+          ref={canvasRef} 
+          className="absolute inset-0 w-full h-full object-cover transform -scale-x-100" 
+        />
         <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black via-black/80 to-transparent p-6 text-center">
           <p className="font-bold text-xl text-white mb-3 tracking-wide">{status}</p>
           <div className="w-full bg-gray-800/50 rounded-full h-2.5 backdrop-blur-md overflow-hidden">
