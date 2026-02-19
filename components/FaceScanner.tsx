@@ -168,8 +168,6 @@ const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onCancel }) =
             // ✅ สำคัญที่ 2: ใช้ตัวแปร width, height แทนการระบุเลข 640, 480
             ctx.clearRect(0, 0, width, height);
             ctx.save();
-            ctx.scale(-1, 1);
-            ctx.translate(-width, 0);
 
             const flatFaceMesh: number[] = [];
             SELECTED_LANDMARKS.forEach(index => {

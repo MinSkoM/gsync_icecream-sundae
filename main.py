@@ -255,7 +255,7 @@ async def predict(
         vision_score = 0.0
 
     # --- 3. FUSION LOGIC ---
-    final_score = (vision_score * 0.4) + (motion_score * 0.6)
+    final_score = (vision_score * 0.3) + (motion_score * 0.7)
     is_live = final_score >= DECISION_THRESHOLD
 
     return {
